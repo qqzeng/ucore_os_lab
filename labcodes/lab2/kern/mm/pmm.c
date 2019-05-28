@@ -40,6 +40,7 @@ size_t npage = 0;
 extern pde_t __boot_pgdir;
 pde_t *boot_pgdir = &__boot_pgdir;
 // physical address of boot-time page directory
+// 页目录表的起始物理地址存放在 cr3 寄存器中， 此地址是一个页对齐的地址，即地址的低12位为0
 uintptr_t boot_cr3;
 
 // physical memory management
@@ -187,6 +188,15 @@ nr_free_pages(void) {
 }
 
 /* pmm_init - initialize the physical memory management */
+/**
+ * 1. 根据物理内存空间探测的结果，先获取最后一个可用空间的结束地址(end，即为Kernel的结束地址)
+ *	  根据这个结束地址计算出整个可用的物理内存空间一共有多少个页 maxpa；
+   2. 找到Kernel的结束地址(end)，这个地址是在kernel.ld中定义的，
+      从此地址所在的下一个页开始(pages)写入系统页的信息(将所有的Page写入这个地址，即其用于存储内核页相关数据结构)；
+   3. 从pages开始，将所有页的信息的flag都设置为reserved(不可用，因为它们是提供给内核使用)；
+   4. 找到free页的开始地址， 并初始化所有free页的信息
+      free页即为除去 kernel本身所占的代码与数据 和 内核页数据 之外的可用空间，明显 reserved 位需要重置。
+ */
 static void
 page_init(void) {
     struct e820map *memmap = (struct e820map *)(0x8000 + KERNBASE);
@@ -211,13 +221,13 @@ page_init(void) {
     extern char end[]; // end 为 bootloader 加载 ucore 内核的结束地址，在 kernel.ld 文件中可以得到
 
     npage = maxpa / PGSIZE;
-    pages = (struct Page *)ROUNDUP((void *)end, PGSIZE);
+    pages = (struct Page *)ROUNDUP((void *)end, PGSIZE); // pages 页的起始地址，即内核页相关数据起始地址
 
-    for (i = 0; i < npage; i ++) { // 标记用于表示物理页面的数据结构 Pages 所占用的内存页为 Reserved
+    for (i = 0; i < npage; i ++) { // 标记用于表示物理页面的数据结构 Pages 所占用的内存页为 Reserved，即内核占用
         SetPageReserved(pages + i);
     }
 
-    uintptr_t freemem = PADDR((uintptr_t)pages + sizeof(struct Page) * npage); // 空闲的内存页
+    uintptr_t freemem = PADDR((uintptr_t)pages + sizeof(struct Page) * npage); // 空闲的内存页 free 的起始地址
 
     for (i = 0; i < memmap->nr_map; i ++) {
         uint64_t begin = memmap->map[i].addr, end = begin + memmap->map[i].size;
@@ -297,6 +307,12 @@ pmm_init(void) {
 
     // recursively insert boot_pgdir in itself
     // to form a virtual page table at virtual address VPT
+    /**
+     * VPT = 0xFAC00000 = 1111 1010 11 | 00 0000 0000 | 0000 0000 0000
+     * 此地址在 ucore 有效地址之外的地址(有效地址从 0xC0000000 到 0xF8000000)
+     * VPD = 0xFAFEB000 = 1111 1010 11 | 11 1110 1011 | 0000 0000 0000
+     * boot_pgdir[PDX(VPT)] 即为其自身设置页目录项的内容
+     */
     boot_pgdir[PDX(VPT)] = PADDR(boot_pgdir) | PTE_P | PTE_W;
 
     // map all physical memory to linear memory with base linear addr KERNBASE
@@ -371,7 +387,8 @@ get_pte(pde_t *pgdir, uintptr_t la, bool create) {
 			*pdep = (pa) | PTE_U | PTE_W | PTE_P; // & 0x0FFF
         }
     }
-    // 1. 获取页目录项中存储的页表的物理地址 TODO
+    // 下面的代码为通过 页目录项 获取指定地址 所对应的页表项
+    // 1. 获取页目录项中存储的页表的物理地址
 	void * pde_addr = PDE_ADDR(*pdep);
 	// 2. 将页表的物理地址转换成内核虚拟地址
 	pte_t *pgTable = KADDR(pde_addr);
@@ -415,13 +432,33 @@ page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep) {
      * DEFINEs:
      *   PTE_P           0x001                   // page table/directory entry flags bit : Present
      */
-#if 0
-    if (0) {                      //(1) check if this page table entry is present
-        struct Page *page = NULL; //(2) find corresponding page to pte
-                                  //(3) decrease page reference
-                                  //(4) and free this page when page reference reachs 0
-                                  //(5) clear second page table entry
-                                  //(6) flush tlb
+#if 1
+	//(1) check if this page table entry is present
+    if (*ptep & PTE_P) {
+    	//(2) find corresponding page to pte
+        struct Page *page = pte2page(*ptep);
+        //(3) decrease page reference
+        page_ref_dec(page);
+        //(4) and free this page when page reference reachs 0
+        // NOTE: 理论上而言，将释放页的代码放在后面会更符合逻辑一些（虽然不影响正确性）
+		if (page_ref(page) == 0) {
+			free_page(page);
+		}
+        //(5) clear second page table entry
+		pte_t *pgTable = page2kva(page);
+
+//		// 也可以通过 页目录项 间接获取页表
+//        // 5.1. 获取页目录项中存储的页表的物理地址
+//        pde_t *pdep = &pgdir[PDX(la)];
+//		void * pde_addr = PDE_ADDR(*pdep);
+//		// 5.2. 将页表的物理地址转换成内核虚拟地址
+//		pte_t *pgTable = KADDR(pde_addr);
+
+		// 将页表中指定项设置为 NULL
+		pgTable[PTX(la)] = NULL;
+
+        //(6) flush tlb
+		tlb_invalidate(pgdir, la);
     }
 #endif
 }
@@ -455,12 +492,12 @@ page_insert(pde_t *pgdir, struct Page *page, uintptr_t la, uint32_t perm) {
         if (p == page) { // 3.2 若其恰好同我们打算建立映射的物理页面相同
             page_ref_dec(page); // 3.3 则递减此物理页被引用的计数
         }
-        else { // 3.4 否则表明此页表项已经同某一物理页建立映射，因此不能需要先将它移除，才能继续建立我们提供的物理页
+        else { // 3.4 否则表明此页表项已经同某一物理页建立映射，因此需要先将它移除，才能继续建立我们提供的物理页的映射
             page_remove_pte(pgdir, la, ptep);
         }
     }
-    // TODO : page2pa 的含义为将页面转换为其代表的物理页的物理地址
-    // 5. 重新赋值页表项新的内容，即关联新的页面
+    // page2pa 的含义为将页面转换为其代表的物理页的物理地址
+    // 4. 重新赋值页表项新的内容，即关联新的页面
     *ptep = page2pa(page) | PTE_P | perm;
     tlb_invalidate(pgdir, la); // 5. 使 TLB 失效
     return 0;

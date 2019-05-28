@@ -120,6 +120,14 @@ default_init_memmap(struct Page *base, size_t n) {
     list_add_before(&free_list, &(base->page_link));
 }
 
+/**
+ * 注意：
+ * 因为实际上在正常使用内存页时，各 page 块会被切分成不连续的多个小的 page 块，每一个小的 page 块可能包含多个连续的页。
+ * 因此，在初始化 free 页的信息时，只将连续多个 free 页中第一个页的信息连入 free_list 中，
+ * 并只将这个页的 property 设置为此 page 块所包含的 free 页的数目。
+ * 而其他 free 页的信息我们只是简单的设置为0。
+ * 理解这一点非常重要！
+ */
 static struct Page *
 default_alloc_pages(size_t n) {
     assert(n > 0);

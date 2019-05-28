@@ -82,9 +82,10 @@ typedef uintptr_t pde_t;
 #define E820_ARM            1       // address range memory
 #define E820_ARR            2       // address range reserved
 
+
 struct e820map {
     int nr_map;
-    struct {
+    struct { // 内存映射地址描述符
         uint64_t addr;
         uint64_t size;
         uint32_t type;
